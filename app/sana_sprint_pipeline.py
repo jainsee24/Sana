@@ -65,6 +65,14 @@ class SanaSprintInference(SanaConfig):
         default="google/shieldgemma-2b",
         metadata={"help": "The path to shield model, we employ ShieldGemma-2B by default."},
     )
+    second_model_path: Optional[str] = field(
+        default=None,
+        metadata={"help": "Optional path to a secondary model used for later denoising steps."},
+    )
+    primary_step_ratio: float = field(
+        default=0.7,
+        metadata={"help": "Fraction of steps to run with the primary model."},
+    )
 
 
 class SanaSprintPipeline(nn.Module):
@@ -105,6 +113,8 @@ class SanaSprintPipeline(nn.Module):
 
         # 2. build Sana model
         self.model = self.build_sana_model(config).to(self.device)
+        self.second_model: Optional[nn.Module] = None
+        self.step_ratio = self.config.primary_step_ratio
 
     def build_vae(self, config):
         vae = get_vae(config.vae_type, config.vae_pretrained, self.device).to(self.vae_dtype)
@@ -131,7 +141,7 @@ class SanaSprintPipeline(nn.Module):
         )
         return model
 
-    def from_pretrained(self, model_path):
+    def from_pretrained(self, model_path, second_model_path: Optional[str] = None):
         state_dict = find_model(model_path)
         state_dict = state_dict.get("state_dict", state_dict)
         if "pos_embed" in state_dict:
@@ -142,6 +152,19 @@ class SanaSprintPipeline(nn.Module):
         self.logger.info("Generating sample from ckpt: %s" % model_path)
         self.logger.warning(f"Missing keys: {missing}")
         self.logger.warning(f"Unexpected keys: {unexpected}")
+
+        secondary_path = second_model_path or self.args.second_model_path
+        if secondary_path:
+            self.second_model = self.build_sana_model(self.config).to(self.device)
+            state_dict = find_model(secondary_path)
+            state_dict = state_dict.get("state_dict", state_dict)
+            if "pos_embed" in state_dict:
+                del state_dict["pos_embed"]
+            missing, unexpected = self.second_model.load_state_dict(state_dict, strict=False)
+            self.second_model.eval().to(self.weight_dtype)
+            self.logger.info("Loaded secondary model from ckpt: %s" % secondary_path)
+            self.logger.warning(f"Missing keys (secondary): {missing}")
+            self.logger.warning(f"Unexpected keys (secondary): {unexpected}")
 
     def register_progress_bar(self, progress_fn=None):
         self.progress_fn = progress_fn if progress_fn is not None else self.progress_fn
@@ -158,6 +181,7 @@ class SanaSprintPipeline(nn.Module):
         generator=None,
         latents=None,
         use_resolution_binning=True,
+        primary_step_ratio=None,
     ):
         self.ori_height, self.ori_width = height, width
         if use_resolution_binning:
@@ -189,6 +213,9 @@ class SanaSprintPipeline(nn.Module):
             timesteps=self.config.timesteps,
         )
         timesteps = scheduler.timesteps
+        ratio = primary_step_ratio if primary_step_ratio is not None else self.step_ratio
+        total_steps = len(timesteps) - 1
+        switch_step = int(total_steps * ratio)
 
         for prompt in prompts:
             # data prepare
@@ -255,11 +282,12 @@ class SanaSprintPipeline(nn.Module):
 
                 #  sCM MultiStep Sampling Loop:
                 for i, t in tqdm(list(enumerate(timesteps[:-1]))):
-
                     timestep = t.expand(latents.shape[0]).to(self.device)
+                    current_model = self.model
+                    if self.second_model is not None and i >= switch_step:
+                        current_model = self.second_model
 
-                    # model prediction
-                    model_pred = sigma_data * self.model(
+                    model_pred = sigma_data * current_model(
                         latents / sigma_data,
                         timestep,
                         caption_embs,
