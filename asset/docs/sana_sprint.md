@@ -73,6 +73,22 @@ image = sana(
 save_image(image, 'sana_sprint.png', nrow=1, normalize=True, value_range=(-1, 1))
 ```
 
+To split denoising steps across two checkpoints, pass a secondary model path and
+specify how many steps to allocate to the primary model:
+
+```python
+sana.from_pretrained(
+    "path/to/1.6B.pth",
+    second_model_path="path/to/0.6B.pth",
+)
+image = sana(
+    prompt=prompt,
+    primary_step_ratio=0.7,
+    num_inference_steps=20,
+    generator=generator,
+)
+```
+
 ## How to Train
 
 ```bash
