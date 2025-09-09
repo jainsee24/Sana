@@ -135,11 +135,17 @@ def visualize(config, args, model, items, bs, sample_steps, cfg_scale, pag_scale
             prompts_all, max_length=max_length_all, padding="max_length", truncation=True, return_tensors="pt"
         ).to(device)
         select_index = [0] + list(range(-config.text_encoder.model_max_length + 1, 0))
-        caption_embs = text_encoder(caption_token.input_ids, caption_token.attention_mask)[0][:, None][
+        caption_full = text_encoder(caption_token.input_ids, caption_token.attention_mask)[0][:, None][
             :, :, select_index
         ]
-        emb_masks = caption_token.attention_mask[:, select_index]
-        null_y = null_caption_embs.repeat(len(prompts), 1, 1)[:, None]
+        mask_full = caption_token.attention_mask[:, select_index]
+        null_full = null_caption_embs[:, select_index][None].repeat(len(prompts), 1, 1, 1)
+
+        token_schedule = args.token_schedule if args.token_schedule else [caption_full.shape[2]]
+        token_schedule = [min(t, caption_full.shape[2]) for t in token_schedule]
+        emb_list = [caption_full[:, :, :t] for t in token_schedule]
+        mask_list = [mask_full[:, :t] for t in token_schedule]
+        null_list = [null_full[:, :, :t] for t in token_schedule]
 
         # start sampling
         with torch.no_grad():
@@ -152,15 +158,53 @@ def visualize(config, args, model, items, bs, sample_steps, cfg_scale, pag_scale
                 device=device,
                 generator=generator,
             )
-            model_kwargs = dict(data_info={"img_hw": hw, "aspect_ratio": ar}, mask=emb_masks)
+            base_kwargs = dict(data_info={"img_hw": hw, "aspect_ratio": ar})
 
-            if args.sampling_algo == "dpm-solver":
+            if args.sampling_algo == "dpm-solver" and len(token_schedule) > 1:
                 dpm_solver = DPMS(
                     model.forward_with_dpmsolver,
-                    condition=caption_embs,
-                    uncondition=null_y,
+                    condition=emb_list[0],
+                    uncondition=null_list[0],
                     cfg_scale=cfg_scale,
-                    model_kwargs=model_kwargs,
+                    model_kwargs={**base_kwargs, "mask": mask_list[0]},
+                )
+                skip_tp = "time_uniform"
+                timesteps = dpm_solver.get_time_steps(
+                    skip_type=skip_tp,
+                    t_T=dpm_solver.noise_schedule.T,
+                    t_0=1.0 / dpm_solver.noise_schedule.total_N,
+                    N=sample_steps,
+                    device=z.device,
+                )
+                step_counts = [args.token_interval] * (len(token_schedule) - 1)
+                step_counts.append(sample_steps - args.token_interval * (len(token_schedule) - 1))
+                start = 0
+                for idx, sc in enumerate(step_counts):
+                    solver = DPMS(
+                        model.forward_with_dpmsolver,
+                        condition=emb_list[idx],
+                        uncondition=null_list[idx],
+                        cfg_scale=cfg_scale,
+                        model_kwargs={**base_kwargs, "mask": mask_list[idx]},
+                    )
+                    z = solver.sample(
+                        z,
+                        steps=sc,
+                        t_start=timesteps[start],
+                        t_end=timesteps[start + sc],
+                        order=2,
+                        skip_type=skip_tp,
+                        method="multistep",
+                    )
+                    start += sc
+                samples = z
+            elif args.sampling_algo == "dpm-solver":
+                dpm_solver = DPMS(
+                    model.forward_with_dpmsolver,
+                    condition=emb_list[0],
+                    uncondition=null_list[0],
+                    cfg_scale=cfg_scale,
+                    model_kwargs={**base_kwargs, "mask": mask_list[0]},
                 )
                 samples = dpm_solver.sample(
                     z,
@@ -176,30 +220,82 @@ def visualize(config, args, model, items, bs, sample_steps, cfg_scale, pag_scale
                     batch_size=n,
                     shape=(config.vae.vae_latent_dim, latent_size_h, latent_size_w),
                     eta=1,
-                    conditioning=caption_embs,
-                    unconditional_conditioning=null_y,
+                    conditioning=emb_list[0],
+                    unconditional_conditioning=null_list[0],
                     unconditional_guidance_scale=cfg_scale,
-                    model_kwargs=model_kwargs,
+                    model_kwargs={**base_kwargs, "mask": mask_list[0]},
                 )[0]
             elif args.sampling_algo == "flow_euler":
                 flow_solver = FlowEuler(
-                    model, condition=caption_embs, uncondition=null_y, cfg_scale=cfg_scale, model_kwargs=model_kwargs
+                    model, condition=emb_list[0], uncondition=null_list[0], cfg_scale=cfg_scale, model_kwargs={**base_kwargs, "mask": mask_list[0]}
                 )
                 samples = flow_solver.sample(
                     z,
                     steps=sample_steps,
                 )
-            elif args.sampling_algo == "flow_dpm-solver":
+            elif args.sampling_algo == "flow_dpm-solver" and len(token_schedule) > 1:
                 dpm_solver = DPMS(
                     model,
-                    condition=caption_embs,
-                    uncondition=null_y,
+                    condition=emb_list[0],
+                    uncondition=null_list[0],
                     guidance_type=guidance_type,
                     cfg_scale=cfg_scale,
                     pag_scale=pag_scale,
                     pag_applied_layers=pag_applied_layers,
                     model_type="flow",
-                    model_kwargs=model_kwargs,
+                    model_kwargs={**base_kwargs, "mask": mask_list[0]},
+                    schedule="FLOW",
+                    interval_guidance=args.interval_guidance,
+                )
+                skip_tp = "time_uniform_flow"
+                timesteps = dpm_solver.get_time_steps(
+                    skip_type=skip_tp,
+                    t_T=dpm_solver.noise_schedule.T,
+                    t_0=1.0 / dpm_solver.noise_schedule.total_N,
+                    N=sample_steps,
+                    device=z.device,
+                    shift=flow_shift,
+                )
+                step_counts = [args.token_interval] * (len(token_schedule) - 1)
+                step_counts.append(sample_steps - args.token_interval * (len(token_schedule) - 1))
+                start = 0
+                for idx, sc in enumerate(step_counts):
+                    solver = DPMS(
+                        model,
+                        condition=emb_list[idx],
+                        uncondition=null_list[idx],
+                        guidance_type=guidance_type,
+                        cfg_scale=cfg_scale,
+                        pag_scale=pag_scale,
+                        pag_applied_layers=pag_applied_layers,
+                        model_type="flow",
+                        model_kwargs={**base_kwargs, "mask": mask_list[idx]},
+                        schedule="FLOW",
+                        interval_guidance=args.interval_guidance,
+                    )
+                    z = solver.sample(
+                        z,
+                        steps=sc,
+                        t_start=timesteps[start],
+                        t_end=timesteps[start + sc],
+                        order=2,
+                        skip_type=skip_tp,
+                        method="multistep",
+                        flow_shift=flow_shift,
+                    )
+                    start += sc
+                samples = z
+            elif args.sampling_algo == "flow_dpm-solver":
+                dpm_solver = DPMS(
+                    model,
+                    condition=emb_list[0],
+                    uncondition=null_list[0],
+                    guidance_type=guidance_type,
+                    cfg_scale=cfg_scale,
+                    pag_scale=pag_scale,
+                    pag_applied_layers=pag_applied_layers,
+                    model_type="flow",
+                    model_kwargs={**base_kwargs, "mask": mask_list[0]},
                     schedule="FLOW",
                     interval_guidance=args.interval_guidance,
                 )
@@ -259,6 +355,8 @@ class SanaInference(SanaConfig):
     ablation_key: Optional[str] = None
     debug: bool = False
     if_save_dirname: bool = False
+    token_schedule: Optional[List[int]] = None
+    token_interval: int = 5
 
 
 if __name__ == "__main__":
