@@ -178,6 +178,8 @@ class SanaPipeline(nn.Module):
         generator=torch.Generator().manual_seed(42),
         latents=None,
         use_resolution_binning=True,
+        secondary_model=None,
+        model_switch_ratio=0.7,
     ):
         self.ori_height, self.ori_width = height, width
         if use_resolution_binning:
@@ -275,6 +277,7 @@ class SanaPipeline(nn.Module):
                         steps=num_inference_steps,
                     )
                 elif self.vis_sampler == "flow_dpm-solver":
+                    switch_step = int(num_inference_steps * model_switch_ratio)
                     scheduler = DPMS(
                         self.model,
                         condition=caption_embs,
@@ -286,6 +289,8 @@ class SanaPipeline(nn.Module):
                         model_type="flow",
                         model_kwargs=model_kwargs,
                         schedule="FLOW",
+                        second_model=secondary_model,
+                        switch_step=switch_step,
                     )
                     scheduler.register_progress_bar(self.progress_fn)
                     sample = scheduler.sample(
