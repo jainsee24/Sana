@@ -613,7 +613,11 @@ class DPM_Solver:
             Burcu Karagol Ayan, S Sara Mahdavi, Rapha Gontijo Lopes, et al. Photorealistic text-to-image diffusion models
             with deep language understanding. arXiv preprint arXiv:2205.11487, 2022b.
         """
-        self.model = lambda x, t: model_fn(x, t.expand(x.shape[0]))
+        self.base_model = lambda x, t: model_fn(x, t.expand(x.shape[0]))
+        self.model = self.base_model
+        self.second_model = None
+        self.switch_step = None
+        self.cur_step = 0
         self.noise_schedule = noise_schedule
         assert algorithm_type in ["dpmsolver", "dpmsolver++"]
         self.algorithm_type = algorithm_type
@@ -625,6 +629,18 @@ class DPM_Solver:
         self.dynamic_thresholding_ratio = dynamic_thresholding_ratio
         self.thresholding_max_val = thresholding_max_val
         self.register_progress_bar()
+
+    def set_secondary_model(self, model_fn, switch_step):
+        """Register a secondary model used after a given step."""
+        self.second_model = lambda x, t: model_fn(x, t.expand(x.shape[0]))
+        self.switch_step = switch_step
+
+        def combined_model(x, t):
+            if self.second_model is not None and self.cur_step >= self.switch_step:
+                return self.second_model(x, t)
+            return self.base_model(x, t)
+
+        self.model = combined_model
 
     def register_progress_bar(self, progress_fn=None):
         """
@@ -1526,6 +1542,7 @@ class DPM_Solver:
                 step = 0
                 t = timesteps[step]
                 t_prev_list = [t]
+                self.cur_step = step
                 model_prev_list = [self.model_fn(x, t)]
                 if self.correcting_xt_fn is not None:
                     x = self.correcting_xt_fn(x, t, step)
@@ -1535,6 +1552,7 @@ class DPM_Solver:
                 # Init the first `order` values by lower order multistep DPM-Solver.
                 for step in range(1, order):
                     t = timesteps[step]
+                    self.cur_step = step
                     x = self.multistep_dpm_solver_update(
                         x, model_prev_list, t_prev_list, t, step, solver_type=solver_type
                     )
@@ -1549,6 +1567,7 @@ class DPM_Solver:
                 # Compute the remaining values by `order`-th order multistep DPM-Solver.
                 for step in tqdm(range(order, steps + 1), disable=os.getenv("DPM_TQDM", "False") == "True"):
                     t = timesteps[step]
+                    self.cur_step = step
                     # We only use lower order for steps < 10
                     # if lower_order_final and steps < 10:
                     if lower_order_final:  # recommended by Shuchen Xue
@@ -1568,6 +1587,7 @@ class DPM_Solver:
                     t_prev_list[-1] = t
                     # We do not need to evaluate the final model value.
                     if step < steps:
+                        self.cur_step = step
                         model_prev_list[-1] = self.model_fn(x, t)
                     # update progress bar
                     self.update_progress(step + 1, len(timesteps))
@@ -1582,8 +1602,10 @@ class DPM_Solver:
                         order,
                     ] * K
                     timesteps_outer = self.get_time_steps(skip_type=skip_type, t_T=t_T, t_0=t_0, N=K, device=device)
+                self.cur_step = 0
                 for step, order in enumerate(orders):
                     s, t = timesteps_outer[step], timesteps_outer[step + 1]
+                    self.cur_step = step
                     timesteps_inner = self.get_time_steps(
                         skip_type=skip_type, t_T=s.item(), t_0=t.item(), N=order, device=device
                     )

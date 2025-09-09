@@ -34,6 +34,8 @@ def DPMS(
     diffusion_steps=1000,
     schedule="VP",
     interval_guidance=None,
+    second_model=None,
+    switch_step=None,
 ):
     if pag_applied_layers is None:
         pag_applied_layers = []
@@ -65,5 +67,23 @@ def DPMS(
         guidance_scale=cfg_scale,
         interval_guidance=interval_guidance,
     )
-    ## 3. Define dpm-solver and sample by multistep DPM-Solver.
-    return DPM_Solver(model_fn, noise_schedule, algorithm_type="dpmsolver++")
+    ## 3. Define dpm-solver and optionally register a secondary model
+    solver = DPM_Solver(model_fn, noise_schedule, algorithm_type="dpmsolver++")
+
+    if second_model is not None and switch_step is not None:
+        second_fn = model_wrapper(
+            second_model,
+            noise_schedule,
+            model_type=model_type,
+            model_kwargs=model_kwargs,
+            guidance_type=guidance_type,
+            pag_scale=pag_scale,
+            pag_applied_layers=pag_applied_layers,
+            condition=condition,
+            unconditional_condition=uncondition,
+            guidance_scale=cfg_scale,
+            interval_guidance=interval_guidance,
+        )
+        solver.set_secondary_model(second_fn, switch_step)
+
+    return solver
